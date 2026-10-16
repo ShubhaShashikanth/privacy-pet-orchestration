@@ -143,7 +143,7 @@ Also includes a sketch of **Private Set Intersection (PSI)**: hospitals find how
 
 ---
 
-## How these PETs compose (CDPG context)
+## How these PETs compose 
 
 ```
 Data contributor proves eligibility     → ZKP (see HIDE project)
