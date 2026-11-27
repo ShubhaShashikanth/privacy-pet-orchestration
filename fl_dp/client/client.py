@@ -5,27 +5,33 @@ Implements Differentially Private Stochastic Gradient Descent
 (Abadi et al., "Deep Learning with Differential Privacy", CCS 2016).
 
 Core DP-SGD steps per mini-batch:
-  1. Compute per-sample gradients (not batch-averaged).
-  2. Clip each per-sample gradient: g_i ← g_i / max(1, ‖g_i‖₂ / C)
-     This bounds the sensitivity — one sample can shift the sum by at most C.
-  3. Sum clipped gradients, then add Gaussian noise scaled to (C · σ):
+  1. Poisson sampling: each local record joins the batch independently
+     with probability q = BATCH_SIZE / n  (needed for the accountant below).
+  2. Compute per-sample gradients (not batch-averaged).
+  3. Clip each per-sample gradient: g_i ← g_i / max(1, ‖g_i‖₂ / C)
+     This bounds the sensitivity — one record can shift the sum by at most C.
+  4. Sum clipped gradients, then add Gaussian noise scaled to (C · σ):
        g̃ = Σ clip(g_i) + 𝒩(0, (Cσ)²I)
-  4. Divide by batch size to get the noisy mean gradient.
+  5. Divide by the *expected* batch size (q · n) to get the noisy mean.
 
-Privacy accounting (Gaussian mechanism):
-  Each step consumes roughly ε ≈ σ⁻¹ · √(2 ln(1/δ)) of the budget.
-  Full accounting uses RDP (Rényi DP) compositors; here we print the
-  naive per-step estimate so the result is interpretable in a demo.
+Privacy accounting:
+  Every step is a Poisson-subsampled Gaussian mechanism with sampling
+  rate q and noise multiplier σ. Steps are composed with a Rényi-DP
+  accountant (Google's dp-accounting library, Mironov et al. 2017/2019)
+  and converted to an (ε, δ) guarantee. The ε reported is record-level
+  DP for this client's local dataset, covering all rounds so far.
 """
 
-import os, time, math, logging
+import os, time, logging
 import numpy as np
 import requests
+from dp_accounting import dp_event
+from dp_accounting.rdp import rdp_privacy_accountant
 from sklearn.datasets import load_breast_cancer
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [CLIENT-%(client_id)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
 # ── hyperparameters ────────────────────────────────────────
 SERVER_URL      = os.getenv("SERVER_URL",      "http://server:5000")
@@ -36,15 +42,12 @@ ROUNDS          = int(os.getenv("ROUNDS",      "10"))
 # Optimisation
 LEARNING_RATE   = float(os.getenv("LR",          "0.05"))
 LOCAL_EPOCHS    = int(os.getenv("LOCAL_EPOCHS",  "3"))
-BATCH_SIZE      = int(os.getenv("BATCH_SIZE",    "32"))
+BATCH_SIZE      = int(os.getenv("BATCH_SIZE",    "16"))
 
 # DP-SGD privacy parameters
 CLIP_NORM       = float(os.getenv("CLIP_NORM",        "1.0"))   # C
-NOISE_MULTIPLIER= float(os.getenv("NOISE_MULTIPLIER", "1.1"))   # σ
+NOISE_MULTIPLIER= float(os.getenv("NOISE_MULTIPLIER", "3.0"))   # σ
 DELTA           = float(os.getenv("DELTA",            "1e-5"))  # δ for (ε,δ)-DP
-
-log = logging.getLogger(__name__)
-log.info = lambda msg, *a: logging.getLogger("CLIENT").info(msg, *a)
 
 
 # ── model ─────────────────────────────────────────────────
@@ -76,41 +79,59 @@ def clip_per_sample(grad_w, grad_b, C):
     scales = np.minimum(1.0, C / norms)                                  # (n,)
     return grad_w * scales[:, None], grad_b * scales
 
-def add_noise(sum_grad_w, sum_grad_b, C, sigma, n):
+def add_noise(sum_grad_w, sum_grad_b, C, sigma, expected_batch):
     """
     Add calibrated Gaussian noise to the *summed* clipped gradients,
-    then normalise by batch size.
+    then normalise by the expected batch size.
 
     Noise std for each coordinate = C · σ  (the Gaussian mechanism).
+    Dividing by the expected (public) batch size rather than the actual
+    sampled size keeps the batch size itself from leaking information.
     """
     noise_w = np.random.normal(0.0, C * sigma, size=sum_grad_w.shape)
     noise_b = np.random.normal(0.0, C * sigma)
-    return (sum_grad_w + noise_w) / n, (sum_grad_b + noise_b) / n
+    return (sum_grad_w + noise_w) / expected_batch, (sum_grad_b + noise_b) / expected_batch
+
+def steps_per_epoch(n, batch_size):
+    return max(1, round(n / batch_size))
 
 def dp_sgd_epoch(X, y, w, b, C, sigma, lr, batch_size):
-    """One full epoch of DP-SGD over the local dataset."""
-    idx = np.random.permutation(len(X))
-    for start in range(0, len(X), batch_size):
-        batch = idx[start : start + batch_size]
-        X_b, y_b = X[batch], y[batch]
+    """
+    One epoch of DP-SGD over the local dataset, using Poisson sampling.
+    Returns the updated model and the number of noisy steps taken.
+    """
+    n = len(X)
+    q = batch_size / n
+    steps = steps_per_epoch(n, batch_size)
+    for _ in range(steps):
+        mask = np.random.random(n) < q          # each record in w.p. q
+        X_b, y_b = X[mask], y[mask]
 
-        gw, gb   = per_sample_gradients(X_b, y_b, w, b)
-        gw, gb   = clip_per_sample(gw, gb, C)
-        mgw, mgb = add_noise(gw.sum(0), gb.sum(), C, sigma, len(batch))
+        if mask.any():
+            gw, gb = per_sample_gradients(X_b, y_b, w, b)
+            gw, gb = clip_per_sample(gw, gb, C)
+            sum_w, sum_b = gw.sum(0), gb.sum()
+        else:                                   # empty batch: noise only
+            sum_w, sum_b = np.zeros_like(w), 0.0
 
+        mgw, mgb = add_noise(sum_w, sum_b, C, sigma, q * n)
         w = w - lr * mgw
         b = b - lr * mgb
-    return w, b
+    return w, b, steps
 
-def privacy_spent(steps, sigma, C, delta, n, batch_size):
+def privacy_spent(steps, sigma, delta, n, batch_size):
     """
-    Naive (conservative) per-step Gaussian mechanism ε estimate.
-    Each step contributes ≈ (C/σ) · sqrt(2·ln(1/δ)) to epsilon.
-    For rigorous accounting, use google/dp-accounting or autodp.
+    ε for `steps` compositions of the Poisson-subsampled Gaussian
+    mechanism (sampling rate q = batch_size / n, noise multiplier σ),
+    computed with a Rényi-DP accountant and converted to (ε, δ)-DP.
     """
-    q   = batch_size / n                             # sampling rate
-    eps_per_step = (C / sigma) * math.sqrt(2 * math.log(1 / delta))
-    return steps * q * eps_per_step
+    accountant = rdp_privacy_accountant.RdpAccountant()
+    event = dp_event.PoissonSampledDpEvent(
+        sampling_probability=batch_size / n,
+        event=dp_event.GaussianDpEvent(noise_multiplier=sigma),
+    )
+    accountant.compose(event, steps)
+    return accountant.get_epsilon(target_delta=delta)
 
 
 # ── data partitioning ──────────────────────────────────────
@@ -122,13 +143,18 @@ def local_dataset(client_id, num_clients):
     (binary label: malignant / benign).
     """
     X, y = load_breast_cancer(return_X_y=True)
-    sc   = StandardScaler()
-    X    = sc.fit_transform(X)
 
-    # Deterministic partition by client index
+    # Deterministic partition by client index. (In this simulation every
+    # container loads the public dataset and keeps only its own slice; in
+    # a real deployment each institution would hold only its own records.)
     mask = np.arange(len(X)) % num_clients == client_id
     Xi, yi = X[mask], y[mask]
-    return train_test_split(Xi, yi, test_size=0.2, random_state=42)
+    X_tr, X_te, y_tr, y_te = train_test_split(Xi, yi, test_size=0.2, random_state=42)
+
+    # Feature scaling is fitted on this client's own training data only,
+    # so no statistics from other clients' records are used.
+    sc = StandardScaler().fit(X_tr)
+    return sc.transform(X_tr), sc.transform(X_te), y_tr, y_te
 
 
 # ── federated training loop ────────────────────────────────
@@ -154,31 +180,32 @@ def run():
     wait_for_server(SERVER_URL)
 
     total_steps  = 0
-    last_round   = -1
 
     for rnd in range(ROUNDS):
-        # ── 1. pull global model ──────────────────────────────
-        resp = requests.get(f"{SERVER_URL}/model", timeout=10).json()
-        w    = np.array(resp["weights"])
-        b    = float(resp["bias"])
-
-        if resp["round"] == last_round:
-            # server hasn't aggregated yet — back off and retry
-            time.sleep(1)
+        # ── 1. pull global model for this round ───────────────
+        # Wait until the server has aggregated the previous round,
+        # so every client starts round `rnd` from the same global model.
+        while True:
+            resp = requests.get(f"{SERVER_URL}/model", timeout=10).json()
+            if resp["round"] >= rnd:
+                break
+            time.sleep(0.5)
+        w = np.array(resp["weights"])
+        b = float(resp["bias"])
 
         # ── 2. local training with DP-SGD ────────────────────
         for _ in range(LOCAL_EPOCHS):
-            w, b  = dp_sgd_epoch(X_tr, y_tr, w, b,
-                                  CLIP_NORM, NOISE_MULTIPLIER,
-                                  LEARNING_RATE, BATCH_SIZE)
-            total_steps += math.ceil(len(X_tr) / BATCH_SIZE)
+            w, b, steps = dp_sgd_epoch(X_tr, y_tr, w, b,
+                                       CLIP_NORM, NOISE_MULTIPLIER,
+                                       LEARNING_RATE, BATCH_SIZE)
+            total_steps += steps
 
         acc   = accuracy(X_te, y_te, w, b)
         eps   = privacy_spent(total_steps, NOISE_MULTIPLIER,
-                               CLIP_NORM, DELTA, len(X_tr), BATCH_SIZE)
+                               DELTA, len(X_tr), BATCH_SIZE)
 
         logging.info(
-            "[Client %d] Round %d — local acc: %.4f | ε spent so far: %.4f (δ=%.0e)",
+            "[Client %d] Round %d — local acc: %.4f | ε spent so far: %.2f (δ=%.0e)",
             CLIENT_ID, rnd + 1, acc, eps, DELTA,
         )
 
@@ -191,7 +218,6 @@ def run():
             "local_acc": float(acc),
         }, timeout=10)
 
-        last_round = rnd
         time.sleep(0.5)   # stagger clients slightly
 
     logging.info("[Client %d] Training complete.", CLIENT_ID)

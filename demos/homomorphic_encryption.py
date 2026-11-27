@@ -36,7 +36,7 @@ def create_he_context() -> ts.Context:
         poly_modulus_degree=8192,
         coeff_mod_bit_sizes=[60, 40, 40, 60],
     )
-    ctx.global_scale = 2 ** 26
+    ctx.global_scale = 2 ** 40   # matches the 40-bit middle primes
     ctx.generate_galois_keys()   # required for vector rotation (dot products)
     return ctx
 
@@ -65,26 +65,43 @@ print("[Hospital] Sending encrypted vector to analytics server.")
 print("           ⚠  Server receives ciphertext — no plaintext visible.")
 
 
+# What actually crosses the wire: a public-only context (no secret key)
+# and the serialized ciphertext.
+public_ctx_bytes = ctx.serialize(save_secret_key=False)
+ciphertext_bytes = enc_v.serialize()
+
+
 # ── 4. Compute on encrypted data (server side) ───────────────────────
-# The server has NO secret key.  It can only use the public context.
-server_ctx = ctx.copy()
-server_ctx.make_context_public()     # drop secret key before handing to server
+# The server rebuilds everything from bytes, so it holds only the public
+# key, relinearisation and Galois keys — never the secret key.
+server_ctx = ts.context_from(public_ctx_bytes)
+assert not server_ctx.has_secret_key()
+server_vec = ts.ckks_vector_from(server_ctx, ciphertext_bytes)
 
 t0 = time.perf_counter()
 
 # Compute the encrypted sum of all elements using SIMD rotations.
-# TenSEAL's .sum() internally uses the Galois keys we generated
-# to rotate the ciphertext vector and accumulate — no decryption needed.
-enc_sum   = enc_v.sum()                  # homomorphic sum (still encrypted)
+# TenSEAL's .sum() uses the Galois keys to rotate the ciphertext vector
+# and accumulate — no decryption needed.
+server_sum = server_vec.sum()            # homomorphic sum (still encrypted)
 
 t_compute = time.perf_counter() - t0
 print(f"\n[Server]   Computing sum on ciphertext ... {t_compute*1000:.1f} ms")
+
+try:                                     # prove the server cannot decrypt
+    server_sum.decrypt()
+    print("[Server]   ✗ unexpectedly able to decrypt!")
+except Exception:
+    print("[Server]   Tried to decrypt → refused: no secret key on the server.")
+
 print("[Server]   Result is still encrypted.  Sending back to hospital.")
 print(f"           N={N_PATIENTS} is public info; dividing by N is a plaintext op.")
+result_bytes = server_sum.serialize()
 
 
 # ── 5. Decrypt (hospital side, with secret key) ──────────────────────
 t0             = time.perf_counter()
+enc_sum        = ts.ckks_vector_from(ctx, result_bytes)
 decrypted_sum  = enc_sum.decrypt()[0]
 decrypted_mean = decrypted_sum / N_PATIENTS   # N is public — no privacy loss
 t_dec          = time.perf_counter() - t0

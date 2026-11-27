@@ -2,7 +2,7 @@ version: "3.9"
 
 # Federated Learning + DP-SGD — containerised demo
 # Each client runs in its own container; they never share data.
-# Only model updates (gradients) cross the network.
+# Only model updates (weights trained with DP-SGD) cross the network.
 #
 # Run:  docker compose up --build
 # Logs: docker compose logs -f client-0
@@ -33,7 +33,8 @@ services:
       ROUNDS:           "10"
       LOCAL_EPOCHS:     "3"
       CLIP_NORM:        "1.0"     # C  — gradient clipping bound
-      NOISE_MULTIPLIER: "1.1"     # σ  — noise scale (higher = more private)
+      NOISE_MULTIPLIER: "3.0"     # σ  — noise scale (higher = more private)
+      BATCH_SIZE:       "16"      # expected Poisson batch size
       DELTA:            "1e-5"    # δ  — failure probability
 
   client-1:
@@ -49,7 +50,8 @@ services:
       ROUNDS:           "10"
       LOCAL_EPOCHS:     "3"
       CLIP_NORM:        "1.0"
-      NOISE_MULTIPLIER: "1.1"
+      NOISE_MULTIPLIER: "3.0"
+      BATCH_SIZE:       "16"
       DELTA:            "1e-5"
 
   client-2:
@@ -65,5 +67,6 @@ services:
       ROUNDS:           "10"
       LOCAL_EPOCHS:     "3"
       CLIP_NORM:        "1.0"
-      NOISE_MULTIPLIER: "1.1"
+      NOISE_MULTIPLIER: "3.0"
+      BATCH_SIZE:       "16"
       DELTA:            "1e-5"
